@@ -118,6 +118,8 @@ func IsTemporary(err error) bool {
 			"w:TimedOut",
 			"w:InternalError",
 			"w:ConcurrencyViolation",
+			"w:QuotaLimitExceeded",
+			"w:ResourceBusy",
 		}
 		for _, code := range temporaryCodes {
 			if soapFault.Code == code {

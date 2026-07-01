@@ -360,6 +360,9 @@ func (c *Command) start(ctx context.Context) (string, error) {
 	return parseExecuteCommandResponse(resp)
 }
 
+// maxReceiveIterations limits the number of receive calls to prevent infinite loops.
+const maxReceiveIterations = 10000
+
 // receive receives the command output.
 func (c *Command) receive(ctx context.Context) (*CommandResult, error) {
 	result := &CommandResult{
@@ -367,7 +370,8 @@ func (c *Command) receive(ctx context.Context) (*CommandResult, error) {
 		stderr: make([]byte, 0, 1024),
 	}
 
-	for {
+	done := false
+	for iteration := 0; iteration < maxReceiveIterations; iteration++ {
 		envelope, err := buildReceiveOutputEnvelope(
 			c.shell.client.endpoint,
 			c.shell.shellID,
@@ -394,8 +398,13 @@ func (c *Command) receive(ctx context.Context) (*CommandResult, error) {
 
 		if recvResult.Done {
 			result.ExitCode = recvResult.ExitCode
+			done = true
 			break
 		}
+	}
+
+	if !done {
+		return nil, fmt.Errorf("receive: exceeded max iterations (%d) without command completion", maxReceiveIterations)
 	}
 
 	return result, nil

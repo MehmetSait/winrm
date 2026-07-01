@@ -3,7 +3,7 @@ package winrm
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +12,10 @@ import (
 	"time"
 
 	"github.com/Azure/go-ntlmssp"
+	krb5client "github.com/jcmturner/gokrb5/v8/client"
+	krb5config "github.com/jcmturner/gokrb5/v8/config"
+	"github.com/jcmturner/gokrb5/v8/keytab"
+	"github.com/jcmturner/gokrb5/v8/spnego"
 )
 
 // Client represents a WinRM client connection.
@@ -241,8 +245,8 @@ func (c *Client) send(ctx context.Context, body []byte) ([]byte, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		// Try to parse SOAP fault from response
-		if _, parseErr := parseCreateShellResponse(respBody); parseErr != nil {
-			return nil, parseErr
+		if faultErr := parseSOAPFaultFromResponse(respBody); faultErr != nil {
+			return nil, faultErr
 		}
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -272,7 +276,7 @@ func isTimeoutError(err error) bool {
 		return false
 	}
 	var netErr net.Error
-	if ok := errorAs(err, &netErr); ok {
+	if errors.As(err, &netErr) {
 		return netErr.Timeout()
 	}
 	return false
@@ -284,28 +288,7 @@ func isConnectionError(err error) bool {
 		return false
 	}
 	var opErr *net.OpError
-	return errorAs(err, &opErr)
-}
-
-// errorAs is a helper for errors.As without importing errors package.
-func errorAs(err error, target interface{}) bool {
-	if err == nil {
-		return false
-	}
-	// Type assertion based on target type
-	switch t := target.(type) {
-	case *net.Error:
-		if e, ok := err.(net.Error); ok {
-			*t = e
-			return true
-		}
-	case **net.OpError:
-		if e, ok := err.(*net.OpError); ok {
-			*t = e
-			return true
-		}
-	}
-	return false
+	return errors.As(err, &opErr)
 }
 
 // Authentication transports
@@ -348,21 +331,77 @@ func (t *basicAuthTransport) RoundTrip(req *http.Request) (*http.Response, error
 	return t.transport.RoundTrip(reqClone)
 }
 
-// kerberosTransport wraps an http.RoundTripper with Kerberos authentication.
-// Note: Full Kerberos implementation requires additional dependencies.
+// kerberosTransport wraps an http.RoundTripper with Kerberos (SPNEGO) authentication.
+// Supports both password-based and keytab-based authentication.
+// The SPNEGO client is lazily initialized on first request and reused for subsequent calls.
 type kerberosTransport struct {
 	transport http.RoundTripper
 	config    *Config
+
+	mu       sync.Mutex
+	spnegoCl *spnego.Client
+	initErr  error
 }
 
 func (t *kerberosTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Kerberos implementation would require:
-	// - github.com/jcmturner/gokrb5 for GSSAPI/SPNEGO
-	// - Proper krb5.conf configuration
-	// - Valid Kerberos ticket (kinit)
-	//
-	// For now, return error indicating Kerberos is not yet implemented
-	return nil, fmt.Errorf("kerberos authentication not yet implemented - use NTLM or Basic auth")
+	spnegoCl, err := t.getSPNEGOClient()
+	if err != nil {
+		return nil, err
+	}
+
+	reqClone := req.Clone(req.Context())
+	return spnegoCl.Do(reqClone)
+}
+
+func (t *kerberosTransport) getSPNEGOClient() (*spnego.Client, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.spnegoCl != nil {
+		return t.spnegoCl, nil
+	}
+	if t.initErr != nil {
+		return nil, t.initErr
+	}
+
+	cfgPath := t.config.Auth.KerberosConfigFile
+	if cfgPath == "" {
+		cfgPath = "/etc/krb5.conf"
+	}
+
+	cfg, err := krb5config.Load(cfgPath)
+	if err != nil {
+		t.initErr = fmt.Errorf("kerberos: failed to load config from %q: %w", cfgPath, err)
+		return nil, t.initErr
+	}
+
+	realm := t.config.Auth.Domain
+	username := t.config.Auth.Username
+
+	var cl *krb5client.Client
+	if t.config.Auth.KerberosCredCache != "" {
+		kt, err := keytab.Load(t.config.Auth.KerberosCredCache)
+		if err != nil {
+			t.initErr = fmt.Errorf("kerberos: failed to load keytab from %q: %w", t.config.Auth.KerberosCredCache, err)
+			return nil, t.initErr
+		}
+		cl = krb5client.NewWithKeytab(username, realm, kt, cfg)
+	} else {
+		cl = krb5client.NewWithPassword(username, realm, t.config.Auth.Password, cfg)
+	}
+
+	if err := cl.Login(); err != nil {
+		t.initErr = fmt.Errorf("kerberos: login failed: %w", err)
+		return nil, t.initErr
+	}
+
+	spn := t.config.Auth.SPN
+	if spn == "" {
+		spn = "WSMAN/" + t.config.Host
+	}
+
+	t.spnegoCl = spnego.NewClient(cl, &http.Client{Transport: t.transport}, spn)
+	return t.spnegoCl, nil
 }
 
 // credsspTransport wraps an http.RoundTripper with CredSSP authentication.
@@ -451,7 +490,7 @@ func (c *Client) NewPool(size int) (*Pool, error) {
 func (p *Pool) Get(ctx context.Context) (*Shell, error) {
 	select {
 	case shell := <-p.shells:
-		if shell.closed {
+		if shell.IsClosed() {
 			return p.client.CreateShellContext(ctx)
 		}
 		return shell, nil
@@ -494,11 +533,4 @@ func (p *Pool) Close() error {
 		shell.Close()
 	}
 	return nil
-}
-
-// configureTransportTLS configures TLS settings on transport.
-func configureTransportTLS(transport *http.Transport, tlsConfig *tls.Config) {
-	if tlsConfig != nil {
-		transport.TLSClientConfig = tlsConfig
-	}
 }

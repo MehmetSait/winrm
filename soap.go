@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
+	"strings"
 	"text/template"
 	"time"
 
@@ -25,6 +26,7 @@ const (
 	commandURI = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command"
 	receiveURI = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive"
 	signalURI  = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal"
+	sendURI    = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Send"
 	deleteURI  = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete"
 	createURI  = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Create"
 )
@@ -210,7 +212,7 @@ func buildCreateShellEnvelope(endpoint string, maxEnvelopeSize int, operationTim
 			MessageID:        newMessageID(),
 			Action:           createURI,
 			ResourceURI:      shellURI,
-			Endpoint:         endpoint,
+			Endpoint:         escapeXML(endpoint),
 			OperationTimeout: formatTimeout(operationTimeout),
 			MaxEnvelopeSize:  maxEnvelopeSize,
 			Codepage:         "65001", // UTF-8
@@ -232,10 +234,10 @@ func buildExecuteCommandEnvelope(endpoint, shellID, command, arguments string, m
 			MessageID:        newMessageID(),
 			Action:           commandURI,
 			ResourceURI:      shellURI,
-			Endpoint:         endpoint,
+			Endpoint:         escapeXML(endpoint),
 			OperationTimeout: formatTimeout(operationTimeout),
 			MaxEnvelopeSize:  maxEnvelopeSize,
-			ShellID:          shellID,
+			ShellID:          escapeXML(shellID),
 			Command:          escapeXML(command),
 			Arguments:        escapeXML(arguments),
 		},
@@ -256,11 +258,11 @@ func buildReceiveOutputEnvelope(endpoint, shellID, commandID string, maxEnvelope
 			MessageID:        newMessageID(),
 			Action:           receiveURI,
 			ResourceURI:      shellURI,
-			Endpoint:         endpoint,
+			Endpoint:         escapeXML(endpoint),
 			OperationTimeout: formatTimeout(operationTimeout),
 			MaxEnvelopeSize:  maxEnvelopeSize,
-			ShellID:          shellID,
-			CommandID:        commandID,
+			ShellID:          escapeXML(shellID),
+			CommandID:        escapeXML(commandID),
 		},
 		Namespaces: xmlNamespaces,
 	}
@@ -279,11 +281,11 @@ func buildSignalEnvelope(endpoint, shellID, commandID, signal string, maxEnvelop
 			MessageID:        newMessageID(),
 			Action:           signalURI,
 			ResourceURI:      shellURI,
-			Endpoint:         endpoint,
+			Endpoint:         escapeXML(endpoint),
 			OperationTimeout: formatTimeout(operationTimeout),
 			MaxEnvelopeSize:  maxEnvelopeSize,
-			ShellID:          shellID,
-			CommandID:        commandID,
+			ShellID:          escapeXML(shellID),
+			CommandID:        escapeXML(commandID),
 			Signal:           signal,
 		},
 		Namespaces: xmlNamespaces,
@@ -303,10 +305,10 @@ func buildDeleteShellEnvelope(endpoint, shellID string, maxEnvelopeSize int, ope
 			MessageID:        newMessageID(),
 			Action:           deleteURI,
 			ResourceURI:      shellURI,
-			Endpoint:         endpoint,
+			Endpoint:         escapeXML(endpoint),
 			OperationTimeout: formatTimeout(operationTimeout),
 			MaxEnvelopeSize:  maxEnvelopeSize,
-			ShellID:          shellID,
+			ShellID:          escapeXML(shellID),
 		},
 		Namespaces: xmlNamespaces,
 	}
@@ -332,7 +334,7 @@ var sendInputTemplate = template.Must(template.New("sendInput").Parse(`<?xml ver
     <p:DataLocale xml:lang="en-US" s:mustUnderstand="false"/>
     <w:OperationTimeout>{{.OperationTimeout}}</w:OperationTimeout>
     <w:ResourceURI s:mustUnderstand="true">{{.ResourceURI}}</w:ResourceURI>
-    <a:Action s:mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Send</a:Action>
+    <a:Action s:mustUnderstand="true">{{.Action}}</a:Action>
     <w:SelectorSet>
       <w:Selector Name="ShellId">{{.ShellID}}</w:Selector>
     </w:SelectorSet>
@@ -369,12 +371,13 @@ func buildSendInputEnvelope(endpoint, shellID, commandID string, data []byte, eo
 		sendInputParams: sendInputParams{
 			envelopeParams: envelopeParams{
 				MessageID:        newMessageID(),
+				Action:           sendURI,
 				ResourceURI:      shellURI,
-				Endpoint:         endpoint,
+				Endpoint:         escapeXML(endpoint),
 				OperationTimeout: formatTimeout(operationTimeout),
 				MaxEnvelopeSize:  maxEnvelopeSize,
-				ShellID:          shellID,
-				CommandID:        commandID,
+				ShellID:          escapeXML(shellID),
+				CommandID:        escapeXML(commandID),
 			},
 			InputData: inputData,
 			EOF:       eof,
@@ -550,72 +553,23 @@ func parseFault(fault *soapFaultResponse) error {
 	}
 }
 
-// decodeBase64 decodes a base64 string, handling empty strings.
+// parseSOAPFaultFromResponse attempts to extract a SOAP fault from any response body.
+// Returns nil if no fault is found.
+func parseSOAPFaultFromResponse(data []byte) error {
+	var envelope soapEnvelope
+	if err := xml.Unmarshal(data, &envelope); err != nil {
+		return nil
+	}
+	if envelope.Body.Fault != nil {
+		return parseFault(envelope.Body.Fault)
+	}
+	return nil
+}
+
+// decodeBase64 decodes a base64 string, handling empty strings and whitespace.
 func decodeBase64(s string) ([]byte, error) {
 	if s == "" {
 		return nil, nil
 	}
-	// Remove whitespace
-	clean := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		if s[i] != ' ' && s[i] != '\n' && s[i] != '\r' && s[i] != '\t' {
-			clean = append(clean, s[i])
-		}
-	}
-	return base64Decode(clean)
-}
-
-// base64Decode decodes base64 data.
-func base64Decode(data []byte) ([]byte, error) {
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-	var lookup [256]byte
-	for i := range lookup {
-		lookup[i] = 0xFF
-	}
-	for i, c := range alphabet {
-		lookup[c] = byte(i)
-	}
-	lookup['='] = 0
-
-	if len(data) == 0 {
-		return nil, nil
-	}
-
-	// Calculate output size
-	padding := 0
-	if len(data) > 0 && data[len(data)-1] == '=' {
-		padding++
-		if len(data) > 1 && data[len(data)-2] == '=' {
-			padding++
-		}
-	}
-	outputLen := (len(data) * 3 / 4) - padding
-
-	result := make([]byte, outputLen)
-	j := 0
-	for i := 0; i < len(data); i += 4 {
-		var n uint32
-		for k := 0; k < 4 && i+k < len(data); k++ {
-			v := lookup[data[i+k]]
-			if v == 0xFF {
-				continue
-			}
-			n = n<<6 | uint32(v)
-		}
-		if j < len(result) {
-			result[j] = byte(n >> 16)
-			j++
-		}
-		if j < len(result) {
-			result[j] = byte(n >> 8)
-			j++
-		}
-		if j < len(result) {
-			result[j] = byte(n)
-			j++
-		}
-	}
-
-	return result, nil
+	return base64.StdEncoding.DecodeString(strings.TrimSpace(s))
 }

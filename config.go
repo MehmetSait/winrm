@@ -5,6 +5,7 @@ package winrm
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"strconv"
 	"time"
@@ -270,11 +271,6 @@ func (c *Config) Validate() error {
 		return ErrInvalidConfig("CredSSP authentication requires HTTPS")
 	}
 
-	// Basic auth over HTTP is insecure
-	if c.Auth.Type == AuthTypeBasic && !c.UseHTTPS {
-		// Just a warning, don't block
-	}
-
 	return nil
 }
 
@@ -301,7 +297,12 @@ func (c *Config) GetTLSConfig() *tls.Config {
 
 	// Add CA cert if provided
 	if len(c.CACert) > 0 {
-		// Note: In production, parse and add to RootCAs pool
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			pool = x509.NewCertPool()
+		}
+		pool.AppendCertsFromPEM(c.CACert)
+		tlsConfig.RootCAs = pool
 	}
 
 	// Add client cert if provided
@@ -325,6 +326,8 @@ func (c *Config) GetEndpoint() string {
 }
 
 // Clone creates a deep copy of the Config.
+// Note: The Transport field (http.RoundTripper) is shared, not deep-copied,
+// since transports are typically reusable and not safely cloneable.
 func (c *Config) Clone() *Config {
 	clone := *c
 	if c.RetryConfig != nil {
