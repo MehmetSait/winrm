@@ -48,7 +48,10 @@ func NewClient(config *Config) (*Client, error) {
 		config.OperationTimeout = 60 * time.Second
 	}
 	if config.MaxEnvelopeSize == 0 {
-		config.MaxEnvelopeSize = 153600
+		// Match the Windows Server default (MaxEnvelopeSizeKB = 500).
+		// The previous 150 KB default was too small for WMI responses with
+		// many instances (e.g. DHCP leases in a large scope).
+		config.MaxEnvelopeSize = 512000
 	}
 	if config.Locale == "" {
 		config.Locale = "en-US"

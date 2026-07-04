@@ -25,6 +25,17 @@ const (
 
 	// WMINamespaceRootCIMV2 is the default WMI namespace root\cimv2.
 	WMINamespaceRootCIMV2 = "root/cimv2"
+
+	// WMINamespaceDHCP is the Microsoft DHCP Server WMI namespace
+	// (root\Microsoft\Windows\DHCP, Windows Server 2012+). The PS_* classes
+	// in it are CDXML method-only classes: they are NOT enumerable via
+	// WMIQuery/WMIEnumerate — use WMIInvoke (or the DHCP helpers) instead.
+	WMINamespaceDHCP = "root/Microsoft/Windows/DHCP"
+
+	// WMINamespaceLegacyDHCP is the legacy DHCP WMI namespace with
+	// enumerable classes (Microsoft_DHCP_Scope, Microsoft_DHCP_Client, ...).
+	// It may not be registered on Windows Server 2012+.
+	WMINamespaceLegacyDHCP = "root/MicrosoftDHCP"
 )
 
 // WMI-specific XML namespaces (replaces shell-specific rsp with wsen and wxf).
@@ -57,41 +68,61 @@ type wmiSelector struct {
 }
 
 // WMIInstance represents a single WMI/CIM instance with its properties.
+// Array-valued properties (e.g. IPAddress) keep all their elements.
+// Properties whose value is null (xsi:nil="true") are omitted from the map,
+// so "not present" means the server reported the property as null.
 type WMIInstance struct {
 	Class      string
-	Properties map[string]string
+	Properties map[string][]string
 }
 
-// GetString returns a property value as string, or empty string if not found.
+// GetString returns the first value of a property as string,
+// or empty string if the property is not present.
 func (i *WMIInstance) GetString(name string) string {
+	if vals := i.Properties[name]; len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
+// GetStrings returns all values of an array-valued property,
+// or nil if the property is not present.
+func (i *WMIInstance) GetStrings(name string) []string {
 	return i.Properties[name]
+}
+
+// Has reports whether the property is present (i.e. was returned by the
+// server with a non-null value).
+func (i *WMIInstance) Has(name string) bool {
+	_, ok := i.Properties[name]
+	return ok
 }
 
 // GetInt returns a property value as int. Returns 0 and an error if not found or not parseable.
 func (i *WMIInstance) GetInt(name string) (int, error) {
-	s, ok := i.Properties[name]
-	if !ok {
+	vals, ok := i.Properties[name]
+	if !ok || len(vals) == 0 {
 		return 0, fmt.Errorf("wmi: property %q not found", name)
 	}
-	return strconv.Atoi(s)
+	return strconv.Atoi(vals[0])
 }
 
 // GetBool returns a property value as bool ("True"/"False"). Returns false and an error if not found.
 func (i *WMIInstance) GetBool(name string) (bool, error) {
-	s, ok := i.Properties[name]
-	if !ok {
+	vals, ok := i.Properties[name]
+	if !ok || len(vals) == 0 {
 		return false, fmt.Errorf("wmi: property %q not found", name)
 	}
-	return strings.EqualFold(s, "True"), nil
+	return strings.EqualFold(vals[0], "True"), nil
 }
 
 // GetUint64 returns a property value as uint64.
 func (i *WMIInstance) GetUint64(name string) (uint64, error) {
-	s, ok := i.Properties[name]
-	if !ok {
+	vals, ok := i.Properties[name]
+	if !ok || len(vals) == 0 {
 		return 0, fmt.Errorf("wmi: property %q not found", name)
 	}
-	return strconv.ParseUint(s, 10, 64)
+	return strconv.ParseUint(vals[0], 10, 64)
 }
 
 // wmiTemplateData wraps WMI envelope params with namespaces.
@@ -327,8 +358,25 @@ type wmiInstanceEl struct {
 }
 
 type wmiPropertyEl struct {
-	XMLName xml.Name
-	Value   string `xml:",chardata"`
+	XMLName  xml.Name
+	Nil      string          `xml:"http://www.w3.org/2001/XMLSchema-instance nil,attr"`
+	Type     string          `xml:"http://www.w3.org/2001/XMLSchema-instance type,attr"`
+	Value    string          `xml:",chardata"`
+	Children []wmiPropertyEl `xml:",any"`
+}
+
+// resolveValue returns the property's text value, descending into nested
+// elements such as <cim:Datetime>. ok is false when the property is
+// null (xsi:nil="true").
+func (p *wmiPropertyEl) resolveValue() (value string, ok bool) {
+	if p.Nil == "true" || p.Nil == "1" {
+		return "", false
+	}
+	v := strings.TrimSpace(p.Value)
+	if v == "" && len(p.Children) > 0 {
+		return p.Children[0].resolveValue()
+	}
+	return v, true
 }
 
 // ---- Response parsers ----
@@ -404,30 +452,34 @@ func parseWMIGetResponse(data []byte) (*WMIInstance, error) {
 		return nil, fmt.Errorf("wmi: missing instance in Get response body")
 	}
 
-	inst := &WMIInstance{
-		Class:      instEl.XMLName.Local,
-		Properties: make(map[string]string, len(instEl.Properties)),
-	}
-	for _, prop := range instEl.Properties {
-		inst.Properties[prop.XMLName.Local] = prop.Value
-	}
-
-	return inst, nil
+	inst := convertInstanceEl(instEl)
+	return &inst, nil
 }
 
 func convertItemsToInstances(items *wmiItemsEl) []WMIInstance {
 	instances := make([]WMIInstance, 0, len(items.Instances))
 	for _, raw := range items.Instances {
-		inst := WMIInstance{
-			Class:      raw.XMLName.Local,
-			Properties: make(map[string]string, len(raw.Properties)),
-		}
-		for _, prop := range raw.Properties {
-			inst.Properties[prop.XMLName.Local] = prop.Value
-		}
-		instances = append(instances, inst)
+		instances = append(instances, convertInstanceEl(&raw))
 	}
 	return instances
+}
+
+// convertInstanceEl converts a raw XML instance element into a WMIInstance,
+// collecting array-valued properties and skipping null (xsi:nil) properties.
+func convertInstanceEl(el *wmiInstanceEl) WMIInstance {
+	inst := WMIInstance{
+		Class:      el.XMLName.Local,
+		Properties: make(map[string][]string, len(el.Properties)),
+	}
+	for _, prop := range el.Properties {
+		v, ok := prop.resolveValue()
+		if !ok {
+			continue
+		}
+		name := prop.XMLName.Local
+		inst.Properties[name] = append(inst.Properties[name], v)
+	}
+	return inst
 }
 
 // ---- Client methods ----
@@ -435,6 +487,10 @@ func convertItemsToInstances(items *wmiItemsEl) []WMIInstance {
 // WMIQuery executes a WQL query against the specified WMI namespace.
 // This is a low-privilege operation that does not create a shell or process
 // on the remote host — it uses WS-Management's enumeration protocol directly.
+//
+// The query text is XML-escaped, but no WQL-level escaping is performed:
+// when building queries from untrusted input, sanitize values yourself
+// (WQL string literals escape ' by doubling it).
 func (c *Client) WMIQuery(ctx context.Context, namespace, wql string) ([]WMIInstance, error) {
 	resourceURI := buildWMIResourceURI(namespace)
 	operationTimeout := formatTimeout(c.config.OperationTimeout)
@@ -444,7 +500,8 @@ func (c *Client) WMIQuery(ctx context.Context, namespace, wql string) ([]WMIInst
 		return nil, err
 	}
 
-	resp, err := c.send(ctx, envelope)
+	// Enumerate is idempotent, so transient failures can be retried safely.
+	resp, err := c.sendWithRetry(ctx, envelope)
 	if err != nil {
 		return nil, fmt.Errorf("wmi query failed: %w", err)
 	}
@@ -455,10 +512,15 @@ func (c *Client) WMIQuery(ctx context.Context, namespace, wql string) ([]WMIInst
 	}
 
 	for enumCtx != "" {
-		enumCtx, more, err := c.wmiPull(ctx, resourceURI, enumCtx)
-		if err != nil {
-			c.wmiRelease(ctx, resourceURI, enumCtx)
-			return nil, err
+		prevCtx := enumCtx
+		var more []WMIInstance
+		var pullErr error
+		enumCtx, more, pullErr = c.wmiPull(ctx, resourceURI, prevCtx)
+		if pullErr != nil {
+			// Release the still-open enumeration context so it does not
+			// leak on the server (they count against WinRM quotas).
+			c.wmiRelease(resourceURI, prevCtx)
+			return nil, pullErr
 		}
 		items = append(items, more...)
 	}
@@ -502,7 +564,8 @@ func (c *Client) WMIGet(ctx context.Context, namespace, className string, keys m
 		return nil, err
 	}
 
-	resp, err := c.send(ctx, envelope)
+	// Get is idempotent, so transient failures can be retried safely.
+	resp, err := c.sendWithRetry(ctx, envelope)
 	if err != nil {
 		return nil, fmt.Errorf("wmi get failed: %w", err)
 	}
@@ -525,6 +588,9 @@ func (c *Client) wmiPull(ctx context.Context, resourceURI, enumContext string) (
 		return "", nil, err
 	}
 
+	// Pull is intentionally NOT retried: a Pull that succeeded server-side
+	// but whose response was lost advances the cursor, so retrying could
+	// silently skip items.
 	resp, err := c.send(ctx, envelope)
 	if err != nil {
 		return "", nil, fmt.Errorf("wmi pull failed: %w", err)
@@ -533,7 +599,11 @@ func (c *Client) wmiPull(ctx context.Context, resourceURI, enumContext string) (
 	return parseWMIPullResponse(resp)
 }
 
-func (c *Client) wmiRelease(ctx context.Context, resourceURI, enumContext string) {
+// wmiRelease releases an enumeration context on the server (best effort).
+// It deliberately uses a fresh context: the caller's context is typically
+// already canceled or timed out when cleanup runs, and skipping Release
+// would leak the enumeration against WinRM server quotas.
+func (c *Client) wmiRelease(resourceURI, enumContext string) {
 	if enumContext == "" {
 		return
 	}
@@ -545,16 +615,18 @@ func (c *Client) wmiRelease(ctx context.Context, resourceURI, enumContext string
 		return
 	}
 
-	releaseCtx, cancel := context.WithTimeout(ctx, c.config.SendTimeout)
+	releaseCtx, cancel := context.WithTimeout(context.Background(), c.config.SendTimeout)
 	defer cancel()
 
 	_, _ = c.send(releaseCtx, envelope)
 }
 
 // buildWMIResourceURI builds the WS-Management resource URI for a WMI namespace.
+// Both "root/cimv2" and the classic "root\cimv2" notations are accepted.
 // For example, "root/cimv2" becomes "http://schemas.microsoft.com/wbem/wsman/1/wmi/root/cimv2/*".
 func buildWMIResourceURI(namespace string) string {
-	ns := strings.Trim(namespace, "/")
+	ns := strings.ReplaceAll(namespace, "\\", "/")
+	ns = strings.Trim(ns, "/")
 	if ns == "" {
 		ns = WMINamespaceRootCIMV2
 	}

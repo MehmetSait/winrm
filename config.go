@@ -45,7 +45,11 @@ type Config struct {
 	// OperationTimeout is the WinRM operation timeout sent to the server.
 	OperationTimeout time.Duration
 
-	// MaxEnvelopeSize is the maximum envelope size for WinRM messages (default: 153600).
+	// MaxEnvelopeSize is the maximum envelope size in bytes for WinRM messages
+	// (default: 512000, matching the Windows Server default of 500 KB).
+	// Increase this if responses are truncated (e.g. WMI queries returning
+	// many instances); the server-side WinRM limit must also be raised:
+	//   Set-Item WSMan:\localhost\MaxEnvelopeSizeKB <value>
 	MaxEnvelopeSize int
 
 	// Locale is the locale for WinRM operations (default: en-US).
