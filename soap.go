@@ -119,8 +119,8 @@ var executeCommandTemplate = template.Must(template.New("executeCommand").Parse(
   </s:Header>
   <s:Body>
     <rsp:CommandLine>
-      <rsp:Command>{{.Command}}</rsp:Command>
-      <rsp:Arguments>{{.Arguments}}</rsp:Arguments>
+      <rsp:Command>{{.Command}}</rsp:Command>{{if .Arguments}}
+      <rsp:Arguments>{{.Arguments}}</rsp:Arguments>{{end}}
     </rsp:CommandLine>
   </s:Body>
 </s:Envelope>`))

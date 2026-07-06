@@ -231,7 +231,7 @@ func DefaultConfig() *Config {
 		SendTimeout:      60 * time.Second,
 		ReceiveTimeout:   60 * time.Second,
 		OperationTimeout: 60 * time.Second,
-		MaxEnvelopeSize:  153600,
+		MaxEnvelopeSize:  512000,
 		Locale:           "en-US",
 		RetryConfig: &RetryConfig{
 			MaxRetries:   3,

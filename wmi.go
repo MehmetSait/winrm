@@ -175,8 +175,7 @@ var wmiPullTemplate = template.Must(template.New("wmiPull").Parse(`<?xml version
   <s:Body>
     <wsen:Pull>
       <wsen:EnumerationContext>{{.EnumContext}}</wsen:EnumerationContext>
-      <w:MaxElements>{{.MaxElements}}</w:MaxElements>
-      <w:MaxTime>PT60S</w:MaxTime>
+      <wsen:MaxElements>{{.MaxElements}}</wsen:MaxElements>
     </wsen:Pull>
   </s:Body>
 </s:Envelope>`))
