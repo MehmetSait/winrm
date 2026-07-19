@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	krb5config "github.com/jcmturner/gokrb5/v8/config"
 )
 
 // Config holds the configuration for connecting to a WinRM server.
@@ -80,6 +82,12 @@ type AuthConfig struct {
 
 	// KerberosConfigFile is the path to krb5.conf for Kerberos.
 	KerberosConfigFile string
+
+	// KerberosConfig, when non-nil, is used directly as the Kerberos configuration
+	// and takes precedence over KerberosConfigFile. It lets callers supply an
+	// in-memory krb5 configuration (e.g. built with config.New()) without writing
+	// a temporary krb5.conf to disk.
+	KerberosConfig *krb5config.Config
 
 	// KerberosCredCache is the path to credential cache for Kerberos.
 	KerberosCredCache string

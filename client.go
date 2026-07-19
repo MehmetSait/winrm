@@ -257,9 +257,13 @@ func (c *Client) send(ctx context.Context, body []byte) ([]byte, error) {
 	return respBody, nil
 }
 
-// Close closes the client and releases all resources.
+// Close closes the client and releases all resources, including any Kerberos
+// client (whose auto-renewal goroutine would otherwise leak).
 func (c *Client) Close() error {
 	c.httpClient.CloseIdleConnections()
+	if closer, ok := c.httpClient.Transport.(io.Closer); ok {
+		return closer.Close()
+	}
 	return nil
 }
 
@@ -343,7 +347,23 @@ type kerberosTransport struct {
 
 	mu       sync.Mutex
 	spnegoCl *spnego.Client
+	krbCl    *krb5client.Client
 	initErr  error
+}
+
+// Close releases the Kerberos client's resources. gokrb5's Login starts a
+// background goroutine that auto-renews the TGT and only stops on Destroy, so
+// this must be called (via Client.Close) once the client is no longer needed to
+// avoid leaking a goroutine per connection.
+func (t *kerberosTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.krbCl != nil {
+		t.krbCl.Destroy()
+		t.krbCl = nil
+	}
+	t.spnegoCl = nil
+	return nil
 }
 
 func (t *kerberosTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -367,15 +387,21 @@ func (t *kerberosTransport) getSPNEGOClient() (*spnego.Client, error) {
 		return nil, t.initErr
 	}
 
-	cfgPath := t.config.Auth.KerberosConfigFile
-	if cfgPath == "" {
-		cfgPath = "/etc/krb5.conf"
-	}
-
-	cfg, err := krb5config.Load(cfgPath)
-	if err != nil {
-		t.initErr = fmt.Errorf("kerberos: failed to load config from %q: %w", cfgPath, err)
-		return nil, t.initErr
+	var cfg *krb5config.Config
+	if t.config.Auth.KerberosConfig != nil {
+		// In-memory configuration supplied by the caller; no krb5.conf file needed.
+		cfg = t.config.Auth.KerberosConfig
+	} else {
+		cfgPath := t.config.Auth.KerberosConfigFile
+		if cfgPath == "" {
+			cfgPath = "/etc/krb5.conf"
+		}
+		loaded, err := krb5config.Load(cfgPath)
+		if err != nil {
+			t.initErr = fmt.Errorf("kerberos: failed to load config from %q: %w", cfgPath, err)
+			return nil, t.initErr
+		}
+		cfg = loaded
 	}
 
 	realm := t.config.Auth.Domain
@@ -397,6 +423,8 @@ func (t *kerberosTransport) getSPNEGOClient() (*spnego.Client, error) {
 		t.initErr = fmt.Errorf("kerberos: login failed: %w", err)
 		return nil, t.initErr
 	}
+	// Retain the client so Close can Destroy it and stop the TGT-renewal goroutine.
+	t.krbCl = cl
 
 	spn := t.config.Auth.SPN
 	if spn == "" {
