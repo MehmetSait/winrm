@@ -6,8 +6,10 @@ package winrm
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
@@ -328,13 +330,14 @@ func (c *Config) GetTLSConfig() *tls.Config {
 	return tlsConfig
 }
 
-// GetEndpoint returns the full WinRM endpoint URL.
+// GetEndpoint returns the full WinRM endpoint URL. IPv6 hosts are bracketed.
 func (c *Config) GetEndpoint() string {
 	scheme := "http"
 	if c.UseHTTPS {
 		scheme = "https"
 	}
-	return scheme + "://" + c.Host + ":" + strconv.Itoa(c.GetPort()) + "/wsman"
+	host := strings.Trim(c.Host, "[]")
+	return scheme + "://" + net.JoinHostPort(host, strconv.Itoa(c.GetPort())) + "/wsman"
 }
 
 // Clone creates a deep copy of the Config.

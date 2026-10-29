@@ -102,6 +102,26 @@ func TestConfigGetEndpoint(t *testing.T) {
 		t.Errorf("GetEndpoint() = %v, want %v", endpoint, expected)
 	}
 }
+func TestConfigGetEndpointIPv6(t *testing.T) {
+	tests := []struct {
+		host     string
+		https    bool
+		port     int
+		expected string
+	}{
+		{"fd00::10", false, 5985, "http://[fd00::10]:5985/wsman"},
+		{"[fd00::10]", false, 5985, "http://[fd00::10]:5985/wsman"},
+		{"fd00::10", true, 5986, "https://[fd00::10]:5986/wsman"},
+		{"192.168.1.1", false, 5985, "http://192.168.1.1:5985/wsman"},
+		{"dc01.example.local", true, 5986, "https://dc01.example.local:5986/wsman"},
+	}
+	for _, tt := range tests {
+		config := &Config{Host: tt.host, Port: tt.port, UseHTTPS: tt.https}
+		if got := config.GetEndpoint(); got != tt.expected {
+			t.Errorf("GetEndpoint(%q) = %v, want %v", tt.host, got, tt.expected)
+		}
+	}
+}
 func TestEncodePowerShell(t *testing.T) {
 	script := "Get-Date"
 	encoded := EncodePowerShellScript(script)
